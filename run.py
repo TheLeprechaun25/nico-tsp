@@ -27,6 +27,7 @@ torch.set_float32_matmul_precision("high")
 
 
 def run(opts):
+    opts.debug = True
     if opts.debug:
         opts.val_graph_types = ['unif']
         opts.val_graph_sizes = [20]

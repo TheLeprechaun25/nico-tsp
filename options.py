@@ -44,6 +44,12 @@ def get_options(args=None):
     parser.add_argument('--ppo_clip', type=float, default=0.2, help='PPO clip ratio')
     parser.add_argument('--grpo_group_size', type=int, default=10, help='Group size for GRPO (1 to disable)')
     parser.add_argument('--init_cost_ref', type=str, default='warmup_best', choices=['warmup_best', 'warmup_last'], help='Reference cost for reward normalization')
+    parser.add_argument('--mc_candidate_size', type=int, default=8,
+                        help='Maximum candidate actions per evaluated state for Monte Carlo branching; the sampled action is always included, <= 0 uses all valid candidates.')
+    parser.add_argument('--mc_rollout_samples', type=int, default=4,
+                        help='Number of Monte Carlo continuations per candidate action when estimating state-action values.')
+    parser.add_argument('--mc_eps', type=float, default=1e-6,
+                        help='Epsilon used in the incumbent-normalized Monte Carlo value target.')
 
     parser.add_argument('--update_old_model_every_batch', action='store_true', default=True, help='Update old policy model every batch in PPO')
     parser.add_argument('--update_old_model_freq', type=int, default=20, help='Frequency (in batches) to update old policy model in PPO if not updating every batch')
@@ -114,6 +120,10 @@ def get_options(args=None):
         raise ValueError(f"il_batch_size must be > 0, got {opts.il_batch_size}")
     if opts.rl_batch_size is not None and opts.rl_batch_size <= 0:
         raise ValueError(f"rl_batch_size must be > 0, got {opts.rl_batch_size}")
+    if opts.mc_rollout_samples <= 0:
+        raise ValueError(f"mc_rollout_samples must be > 0, got {opts.mc_rollout_samples}")
+    if opts.mc_eps <= 0:
+        raise ValueError(f"mc_eps must be > 0, got {opts.mc_eps}")
 
     def _validate_range(name, value):
         lo, hi = map(int, value)

@@ -20,3 +20,13 @@ python run.py --eval_only --load_path /path/to/model.pt
 python run.py --eval_only --verbose --T_max_eval_mult 10 --load_path outputs/nico100/rl_epoch-110.pt
 
 
+## TO-DOs
+- [ ] Check tabu actions are correctly masked.
+- [ ] Scale problem. Sample instances with a freq inverse to the obtained reward scale
+- [ ] Credit Assignment problem. use montecarlo rollouts to estimate the value of each action. 
+       Avoid repeating states and doing wastefull work. keep a number of possible samples from each state and sample that many actions.
+- [ ] Training efficiency. Collect different states of the same instance with the reference policy.
+
+
+
+
