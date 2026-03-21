@@ -26,9 +26,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
 
-def run(opts):
-    opts.debug = True
-    if opts.debug:
+def _apply_debug_overrides(opts):
+    if getattr(opts, "debug", False):
         opts.val_graph_types = ['unif']
         opts.val_graph_sizes = [20]
         opts.num_val_samples = [10]
@@ -51,6 +50,10 @@ def run(opts):
         else:
             opts.save_dir = requested_save_dir if requested_save_dir else None
 
+
+def run(opts):
+    opts.debug = True
+    _apply_debug_overrides(opts)
     schedule = resolve_epoch_schedule(opts)
 
     # Set the random seed

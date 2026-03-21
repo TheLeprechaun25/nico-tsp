@@ -55,33 +55,6 @@ def envelope_min(v_big: torch.Tensor, K: int, B: int) -> torch.Tensor:
     return v_big.view(K, B).min(dim=0).values
 
 
-def _extract_optimal_costs(
-    batch: Dict[str, Any],
-    val_dataset: Any,
-    batch_offset: int,
-    batch_size: int,
-    ref: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    # Prefer batch-provided optimal costs if available (works with custom datasets/collate fns).
-    for key in ("optimal_cost", "opt_cost", "best_known_cost", "target_cost"):
-        if key in batch:
-            vals = torch.as_tensor(batch[key], dtype=ref.dtype, device=ref.device).view(-1)
-            return vals if vals.numel() == batch_size else None
-
-    # Fallback: common dataset attribute names, sliced consistently with shuffle=False.
-    for attr in ("optimal_costs", "opt_costs", "best_known_costs", "target_costs"):
-        if not hasattr(val_dataset, attr):
-            continue
-        raw = getattr(val_dataset, attr)
-        try:
-            vals = torch.as_tensor(raw[batch_offset:batch_offset + batch_size], dtype=ref.dtype, device=ref.device).view(-1)
-        except Exception:
-            continue
-        return vals if vals.numel() == batch_size else None
-
-    return None
-
-
 _CONCORDE_OPT_CACHE: Dict[str, Optional[torch.Tensor]] = {}
 
 
@@ -548,7 +521,6 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         improvement_chunks: List[torch.Tensor] = []
         reward_chunks: List[torch.Tensor] = []
         optimal_value_chunks: List[torch.Tensor] = []
-        have_optimal_for_all = True
         batch_histories: List[Dict[str, Any]] = []
 
         loader = DataLoader(val_dataset, batch_size=eval_bs, shuffle=False, pin_memory=True)
@@ -568,16 +540,22 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
                 load_path=load_path,
             )
             init_values = [problem.get_costs(coords, s) for s in init_solutions]  # list of (B,)
-            opt_costs = _extract_optimal_costs(batch, val_dataset, batch_offset, B, init_values[0])
-            if opt_costs is None and dataset_concorde_opt is not None:
+            opt_costs = None
+            if dataset_concorde_opt is not None:
                 sl = dataset_concorde_opt[batch_offset:batch_offset + B]
                 if int(sl.numel()) == B:
                     opt_costs = sl.to(device=init_values[0].device, dtype=init_values[0].dtype)
 
             if opt_costs is None:
-                have_optimal_for_all = False
+                opt_costs = torch.full(
+                    (B,),
+                    float("nan"),
+                    device=init_values[0].device,
+                    dtype=init_values[0].dtype,
+                )
             else:
-                optimal_value_chunks.append(opt_costs.detach())
+                opt_costs = opt_costs.detach()
+            optimal_value_chunks.append(opt_costs)
 
             t0 = time.time()
             if restarts == 1:
@@ -619,12 +597,14 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         best_std = float(best_flat.std(unbiased=False).item()) if best_flat.numel() > 1 else 0.0
 
         gap_to_opt_pct: Optional[float] = None
-        if have_optimal_for_all and optimal_value_chunks:
+        if optimal_value_chunks:
             opt_flat = torch.cat(optimal_value_chunks, 0).view(-1).float()
             if opt_flat.numel() == best_flat.numel():
                 valid = torch.isfinite(opt_flat) & (opt_flat > 0)
-                if bool(valid.all()):
-                    gap_to_opt_pct = float((((best_flat - opt_flat) / opt_flat) * 100.0).mean().item())
+                if bool(valid.any()):
+                    best_valid = best_flat[valid]
+                    opt_valid = opt_flat[valid]
+                    gap_to_opt_pct = float((((best_valid - opt_valid) / opt_valid) * 100.0).mean().item())
 
         if getattr(opts, "verbose", False):
             gap_str = f"{gap_to_opt_pct:.4f}%" if gap_to_opt_pct is not None else "N/A"

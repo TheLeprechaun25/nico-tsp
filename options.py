@@ -114,6 +114,10 @@ def get_options(args=None):
 
     if opts.batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {opts.batch_size}")
+    if opts.il_horizon <= 0:
+        raise ValueError(f"il_horizon must be > 0, got {opts.il_horizon}")
+    if opts.rl_horizon <= 0:
+        raise ValueError(f"rl_horizon must be > 0, got {opts.rl_horizon}")
     if opts.start_lr is not None and opts.start_lr <= 0:
         raise ValueError(f"start_lr must be > 0, got {opts.start_lr}")
     if opts.il_batch_size is not None and opts.il_batch_size <= 0:
