@@ -97,7 +97,7 @@ def run(opts):
     load_data = {}
     if opts.load_path is not None:
         if getattr(opts, "is_main_process", True):
-            print('  [*] Loading data from {}'.format(opts.load_path))
+            print('  [*] Loading checkpoint from {}'.format(opts.load_path))
         load_data = torch_load_cpu(opts.load_path)
 
     # Apply model hyperparameters saved with the checkpoint if available
@@ -119,10 +119,11 @@ def run(opts):
     model_ = get_inner_model(model)
     model_.load_state_dict({**model_.state_dict(), **load_data.get('model', {})})
 
-    # Load the validation datasets
     val_datasets = []
-    for graph_type, graph_size, n_samples in zip(opts.val_graph_types, opts.val_graph_sizes, opts.num_val_samples):
-        val_datasets.append(problem.make_dataset(opts=opts, graph_type=graph_type, graph_size=graph_size, num_samples=n_samples, test=True))
+    should_load_val = opts.eval_only or (not getattr(opts, "skip_train_validation", False))
+    if should_load_val:
+        for graph_type, graph_size, n_samples in zip(opts.val_graph_types, opts.val_graph_sizes, opts.num_val_samples):
+            val_datasets.append(problem.make_dataset(opts=opts, graph_type=graph_type, graph_size=graph_size, num_samples=n_samples, test=True))
 
     # Do validation only
     if opts.eval_only:

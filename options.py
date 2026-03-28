@@ -43,7 +43,15 @@ def get_options(args=None):
     parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
     parser.add_argument('--ppo_clip', type=float, default=0.2, help='PPO clip ratio')
     parser.add_argument('--grpo_group_size', type=int, default=10, help='Group size for GRPO (1 to disable)')
+    parser.add_argument('--rl_group_rotations', type=int, default=1,
+                        help='Number of evenly spaced coordinate rotations to instantiate within each RL group. '
+                             'Must divide the effective GRPO group size. 1 disables rotation augmentation.')
+    parser.add_argument('--rl_rotation_consistency_coef', type=float, default=0.0,
+                        help='Coefficient for the RL rotation-consistency regularizer. '
+                             '0 disables the auxiliary loss and preserves the current objective.')
     parser.add_argument('--init_cost_ref', type=str, default='warmup_best', choices=['warmup_best', 'warmup_last'], help='Reference cost for reward normalization')
+    parser.add_argument('--rl_reward_norm', type=str, default='rel_init', choices=['rel_init', 'rel_current'],
+                        help='RL reward normalization mode: use the initial warmup reference cost or accumulate per-improvement gains relative to the current incumbent cost.')
     parser.add_argument('--mc_candidate_size', type=int, default=8,
                         help='Maximum candidate actions per evaluated state for Monte Carlo branching; the sampled action is always included, <= 0 uses all valid candidates.')
     parser.add_argument('--mc_rollout_samples', type=int, default=4,
@@ -93,9 +101,16 @@ def get_options(args=None):
     parser.add_argument('--eval_batch_size', type=int, default=100, help="Batch size to use during (baseline) evaluation")
     parser.add_argument('--T_max_eval_mult', type=float, default=4.0, help='Max number of steps multiplier for evaluation (T_max = T_max_eval_mult * graph_size)')
     parser.add_argument('--eval_init_method', type=str, default='sequential', choices=['random', 'sequential', 'load'], help='Method to initialize the first node in evaluation')
-    parser.add_argument('--eval_init_path', type=str, default=None, help='Path to initial solutions for evaluation, --eval_init_method needs to be = "load"')
+    parser.add_argument('--eval_init_path', type=str, default=None,
+                        help='Path to initial solutions for evaluation, --eval_init_method needs to be = "load". '
+                             'May be a concrete file, a path template with {tag}/{graph_type}/{graph_size}, '
+                             'or a tagged file like ...unif500... that will be auto-rewritten per validation tag if matching sibling files exist.')
     parser.add_argument('--eval_restarts', type=int, default=1, help="Parallel evaluation restarts")
     parser.add_argument('--save_full_trace', action='store_true', help='Save full trace in evaluation mode.')
+    parser.add_argument('--save_restart_traces', action='store_true',
+                        help='When saving multistart evaluation traces, also save per-restart trajectories in addition to the envelope trace.')
+    parser.add_argument('--skip_train_validation', action='store_true',
+                        help='Skip per-epoch validation during training to reduce runtime. Has no effect in --eval_only mode.')
 
     # Misc
     parser.add_argument('--no_progress_bar', action='store_true', help='Disable progress bar')
@@ -128,6 +143,22 @@ def get_options(args=None):
         raise ValueError(f"mc_rollout_samples must be > 0, got {opts.mc_rollout_samples}")
     if opts.mc_eps <= 0:
         raise ValueError(f"mc_eps must be > 0, got {opts.mc_eps}")
+    if opts.rl_group_rotations <= 0:
+        raise ValueError(f"rl_group_rotations must be > 0, got {opts.rl_group_rotations}")
+    if opts.rl_rotation_consistency_coef < 0:
+        raise ValueError(
+            f"rl_rotation_consistency_coef must be >= 0, got {opts.rl_rotation_consistency_coef}"
+        )
+    eff_grpo_group_size = max(1, int(opts.grpo_group_size))
+    if opts.rl_group_rotations > eff_grpo_group_size:
+        raise ValueError(
+            f"rl_group_rotations ({opts.rl_group_rotations}) must be <= effective grpo_group_size ({eff_grpo_group_size})"
+        )
+    if eff_grpo_group_size % opts.rl_group_rotations != 0:
+        raise ValueError(
+            f"effective grpo_group_size ({eff_grpo_group_size}) must be divisible by "
+            f"rl_group_rotations ({opts.rl_group_rotations})"
+        )
 
     def _validate_range(name, value):
         lo, hi = map(int, value)

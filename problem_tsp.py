@@ -1,3 +1,4 @@
+import math
 import os
 
 import numpy as np
@@ -53,6 +54,54 @@ class TSP(object):
         length = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1) + (d[:, 0] - d[:, -1]).norm(p=2, dim=1)
 
         return length
+
+    @staticmethod
+    def build_even_rotation_angles(num_rotations: int, device, dtype) -> torch.Tensor:
+        num_rotations = int(num_rotations)
+        if num_rotations <= 0:
+            raise ValueError(f"num_rotations must be > 0, got {num_rotations}")
+        step = (2.0 * math.pi) / float(num_rotations)
+        return torch.arange(num_rotations, device=device, dtype=dtype) * step
+
+    @staticmethod
+    def rotate_coords_by_angles(
+        coords: torch.Tensor,
+        angles: torch.Tensor,
+        center: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        coords:  (B, N, 2)
+        angles:  (R,)
+        center:  optional (B, 1, 2) or (B, 2)
+        returns: (B, R, N, 2)
+        """
+        if coords.dim() != 3 or coords.size(-1) != 2:
+            raise ValueError(f"Expected coords with shape (B, N, 2), got {tuple(coords.shape)}")
+        if angles.dim() != 1:
+            raise ValueError(f"Expected angles with shape (R,), got {tuple(angles.shape)}")
+
+        if center is None:
+            center = coords.mean(dim=1, keepdim=True)
+        elif center.dim() == 2:
+            center = center.unsqueeze(1)
+        elif center.dim() != 3:
+            raise ValueError(f"Expected center with shape (B, 2) or (B, 1, 2), got {tuple(center.shape)}")
+
+        centered = coords.unsqueeze(1) - center.unsqueeze(1)
+        cos = torch.cos(angles).view(1, -1, 1, 1)
+        sin = torch.sin(angles).view(1, -1, 1, 1)
+
+        x = centered[..., 0:1]
+        y = centered[..., 1:2]
+        x_rot = cos * x - sin * y
+        y_rot = sin * x + cos * y
+        rotated = torch.cat([x_rot, y_rot], dim=-1)
+        return rotated + center.unsqueeze(1)
+
+    @staticmethod
+    def rotate_coords_evenly(coords: torch.Tensor, num_rotations: int, center: torch.Tensor = None) -> torch.Tensor:
+        angles = TSP.build_even_rotation_angles(num_rotations, device=coords.device, dtype=coords.dtype)
+        return TSP.rotate_coords_by_angles(coords, angles, center=center)
 
     @staticmethod
     def get_node_adjacency(rec: torch.Tensor) -> torch.Tensor:
@@ -115,25 +164,76 @@ class TSP(object):
         Accepts:
           - payload["first_k_solutions"]: list len M, each (K,N)
           - payload["first_solutions"]:   list len M, each (N,)
+          - POMO pickle: payload["batches"][0]["first_sample_best_tours"] with shape (M,N)
+          - LEHD trace: .npz file with payload["improved_tours"] with shape (M,K,N)
+            where slot 0 is the initial constructive tour and later slots are
+            accepted improvements, if any.
         Returns: pool_np (M, Kpool, N) int64
         """
         load_path = os.path.expanduser(load_path)
         if load_path in self._init_pool_cache:
             return self._init_pool_cache[load_path]
 
-        with open(load_path, "rb") as f:
-            payload = pickle.load(f)
+        suffix = os.path.splitext(load_path)[1].lower()
 
-        if isinstance(payload, dict) and payload.get("first_k_solutions", None) is not None:
-            lst = payload["first_k_solutions"]
-            pool = np.stack([np.asarray(x, dtype=np.int64) for x in lst], axis=0)  # (M,K,N)
+        if suffix == ".npz":
+            with np.load(load_path, allow_pickle=True) as payload:
+                if "improved_tours" not in payload:
+                    raise KeyError(f"No improved_tours in LEHD trace {load_path}")
 
-        elif isinstance(payload, dict) and payload.get("first_solutions", None) is not None:
-            lst = payload["first_solutions"]
-            pool = np.stack([np.asarray(x, dtype=np.int64)[None, :] for x in lst], axis=0)  # (M,1,N)
+                pool = np.asarray(payload["improved_tours"], dtype=np.int64)
+                if pool.ndim == 2:
+                    pool = pool[:, None, :]
+                elif pool.ndim != 3:
+                    raise ValueError(f"Expected improved_tours to have 2 or 3 dims, got shape {pool.shape}")
 
+                M, Kpool, _ = pool.shape
+                if "improvement_counts" in payload:
+                    counts = np.asarray(payload["improvement_counts"], dtype=np.int64).reshape(-1)
+                    if counts.shape[0] != M:
+                        raise ValueError(
+                            f"improvement_counts length {counts.shape[0]} does not match improved_tours M={M}"
+                        )
+                    counts = np.clip(counts, 1, Kpool)
+                    for m in range(M):
+                        valid = int(counts[m])
+                        pool[m, valid:, :] = pool[m, 0:1, :]
+                else:
+                    invalid = np.any(pool < 0, axis=-1)
+                    if bool(invalid.any()):
+                        for m in range(M):
+                            valid_idx = np.flatnonzero(~invalid[m])
+                            if valid_idx.size == 0:
+                                raise ValueError(f"Instance {m} in {load_path} has no valid LEHD tours")
+                            pool[m, invalid[m], :] = pool[m, valid_idx[0], :]
         else:
-            raise KeyError(f"No first_k_solutions/first_solutions in {load_path}")
+            with open(load_path, "rb") as f:
+                payload = pickle.load(f)
+
+            if isinstance(payload, dict) and payload.get("first_k_solutions", None) is not None:
+                lst = payload["first_k_solutions"]
+                pool = np.stack([np.asarray(x, dtype=np.int64) for x in lst], axis=0)  # (M,K,N)
+
+            elif isinstance(payload, dict) and payload.get("first_solutions", None) is not None:
+                lst = payload["first_solutions"]
+                pool = np.stack([np.asarray(x, dtype=np.int64)[None, :] for x in lst], axis=0)  # (M,1,N)
+
+            elif isinstance(payload, dict) and payload.get("batches", None) is not None:
+                batches = payload["batches"]
+                if len(batches) == 0 or "first_sample_best_tours" not in batches[0]:
+                    raise KeyError(f"No first_sample_best_tours in POMO payload {load_path}")
+                tours = np.asarray(batches[0]["first_sample_best_tours"], dtype=np.int64)
+                if tours.ndim != 2:
+                    raise ValueError(
+                        f"Expected first_sample_best_tours to have shape (M,N), got {tours.shape}"
+                    )
+                pool = tours[:, None, :]
+
+            else:
+                raise KeyError(
+                    f"Unsupported init file format for {load_path}. "
+                    f"Expected generic first_solutions/first_k_solutions, POMO batches, or LEHD improved_tours."
+                )
 
         self._init_pool_cache[load_path] = pool
         return pool

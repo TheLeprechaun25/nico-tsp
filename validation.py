@@ -1,8 +1,10 @@
 import os
 import time
 import pickle
+import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from utils import move_to, get_inner_model
@@ -40,9 +42,54 @@ class RolloutRecorder:
 
     def finalize(self):
         if self.save:
-            return {"events": self.hist.events, "costs": self.hist.best_costs, "times": self.hist.times}
+            costs = None
+            if self.hist.best_costs is not None:
+                costs = np.asarray(self.hist.best_costs, dtype=np.float32)
+
+            times = None
+            if self.hist.times is not None:
+                times = np.asarray(self.hist.times, dtype=np.float32)
+
+            return {"events": self.hist.events, "costs": costs, "times": times}
         else:
             return None
+
+
+def _attach_trace_metadata(hist: Optional[Dict[str, Any]], trace_type: str, num_restarts: int) -> Optional[Dict[str, Any]]:
+    if hist is None:
+        return None
+    payload = dict(hist)
+    payload["trace_type"] = str(trace_type)
+    payload["num_restarts"] = int(num_restarts)
+    return payload
+
+
+def _split_parallel_history_by_restart(hist_big: Optional[Dict[str, Any]], K: int, B: int) -> Optional[List[Dict[str, Any]]]:
+    if hist_big is None:
+        return None
+
+    times = hist_big.get("times")
+    costs_big = hist_big.get("costs")
+    events_big = hist_big.get("events")
+    out: List[Dict[str, Any]] = []
+
+    for k in range(K):
+        lo = k * B
+        hi = (k + 1) * B
+        costs_k = None if costs_big is None else costs_big[:, lo:hi].copy()
+        events_k = None if events_big is None else events_big[lo:hi]
+        out.append(
+            {
+                "restart_index": int(k),
+                "trace_type": "restart",
+                "num_restarts": int(K),
+                "events": events_k,
+                "costs": costs_k,
+                "times": times,
+            }
+        )
+
+    return out
 
 
 # =========================
@@ -56,6 +103,7 @@ def envelope_min(v_big: torch.Tensor, K: int, B: int) -> torch.Tensor:
 
 
 _CONCORDE_OPT_CACHE: Dict[str, Optional[torch.Tensor]] = {}
+_GRAPH_TAG_RE = re.compile(r"(unif|tsplib)\d+")
 
 
 def _load_concorde_opt_costs(graph_type: str, graph_size: int, num_instances: int) -> Optional[torch.Tensor]:
@@ -104,6 +152,48 @@ def _load_concorde_opt_costs(graph_type: str, graph_size: int, num_instances: in
     if opt_all is None:
         return None
     return opt_all[:num_instances]
+
+
+def _resolve_eval_init_path(raw_path: str, graph_type: str, graph_size: int) -> str:
+    """
+    Resolves a per-tag init path for validation.
+    Supported patterns:
+      - explicit templates: .../{graph_type}{graph_size}.pkl or .../{tag}.npz
+      - implicit tag rewrite: a path containing one graph tag such as "unif500"
+        will be rewritten to the current validation tag if a matching sibling file exists
+    """
+    raw_path = os.path.expanduser(str(raw_path))
+    tag = f"{graph_type}{graph_size}"
+
+    templated = (
+        raw_path
+        .replace("{graph_type}", str(graph_type))
+        .replace("{graph_size}", str(graph_size))
+        .replace("{tag}", tag)
+    )
+    if templated != raw_path:
+        return templated
+
+    matches = list(_GRAPH_TAG_RE.finditer(raw_path))
+    if not matches:
+        return raw_path
+
+    if any(m.group(0) == tag for m in matches):
+        return raw_path
+
+    for m in reversed(matches):
+        candidate = raw_path[:m.start()] + tag + raw_path[m.end():]
+        if os.path.exists(candidate):
+            return candidate
+
+    candidate = raw_path[:matches[-1].start()] + tag + raw_path[matches[-1].end():]
+    if os.path.exists(raw_path):
+        raise FileNotFoundError(
+            f"eval_init_path='{raw_path}' does not match validation tag '{tag}', and auto-resolved "
+            f"candidate '{candidate}' does not exist. Use a per-tag path template such as '{{tag}}' "
+            f"or provide matching init files for each validation dataset."
+        )
+    return candidate
 
 
 def _get_tabu_cfg(opts) -> Dict[str, Any]:
@@ -402,7 +492,7 @@ def rollout_plain(
 
         rec.record_step(t, time.time() - start_t, best_report, improved)
 
-    hist = rec.finalize()
+    hist = _attach_trace_metadata(rec.finalize(), trace_type="plain", num_restarts=1)
     return best_report.view(-1, 1), torch.stack(improvements, 1), torch.stack(rewards, 1), hist
 
 
@@ -417,6 +507,7 @@ def rollout_multistart_parallel_envelope(
     T: int,
     do_sample: bool,
     save: bool,
+    save_restart_traces: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """
     Runs K starts in parallel by expanding batch to (K*B).
@@ -442,10 +533,17 @@ def rollout_multistart_parallel_envelope(
     env_best = envelope_min(best_big, K, B)
 
     rec = RolloutRecorder(B=B, save=save)
+    restart_rec = RolloutRecorder(B=K * B, save=save and save_restart_traces)
     inner = get_inner_model(model)
 
     start_t = time.time()
     rec.record_step(0, time.time() - start_t, env_best, torch.zeros(B, device=opts.device, dtype=torch.bool))
+    restart_rec.record_step(
+        0,
+        time.time() - start_t,
+        best_big,
+        torch.zeros(K * B, device=opts.device, dtype=torch.bool),
+    )
 
     improvements, rewards = [], []
 
@@ -467,6 +565,7 @@ def rollout_multistart_parallel_envelope(
         obj_big = problem.get_costs(coords_big, sol_big)
 
         cost_big = obj_big
+        best_big_prev = best_big
         best_big = torch.minimum(best_big, obj_big)
 
         env_cost_new = envelope_min(cost_big, K, B)
@@ -482,8 +581,12 @@ def rollout_multistart_parallel_envelope(
         _update_tabu_state(tabu_state, tabu_cfg, prev_sol_big, exchange)
 
         rec.record_step(t, time.time() - start_t, env_best, improved)
+        restart_rec.record_step(t, time.time() - start_t, best_big, best_big < best_big_prev)
 
-    hist = rec.finalize()
+    hist = _attach_trace_metadata(rec.finalize(), trace_type="multistart_envelope", num_restarts=K)
+    restart_hist = restart_rec.finalize()
+    if hist is not None and restart_hist is not None:
+        hist["restart_traces"] = _split_parallel_history_by_restart(restart_hist, K=K, B=B)
     return env_best.view(-1, 1), torch.stack(improvements, 1), torch.stack(rewards, 1), hist
 
 
@@ -493,7 +596,6 @@ def rollout_multistart_parallel_envelope(
 def validate(problem, model, val_datasets, opts, save_full_trace=False):
     model.eval()
     val_metrics: Dict[str, float] = {}
-    all_history: Dict[str, Any] = {}
 
     eval_bs = int(getattr(opts, "eval_batch_size", 1))
 
@@ -510,8 +612,11 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
 
         load_path = None
         if init_method == "load":
-            load_path = getattr(opts, "eval_init_path", None)
-            assert load_path is not None, "opts.eval_init_path must be set when eval_init_method='load'"
+            raw_load_path = getattr(opts, "eval_init_path", None)
+            assert raw_load_path is not None, "opts.eval_init_path must be set when eval_init_method='load'"
+            load_path = _resolve_eval_init_path(raw_load_path, str(graph_type), int(graph_size))
+            if getattr(opts, "verbose", False) and load_path != os.path.expanduser(str(raw_load_path)):
+                print(f"[{tag}] resolved eval init path: {load_path}")
 
         batch_offset = 0
         batch_times: List[float] = []
@@ -569,6 +674,7 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
                     problem, model,
                     coords, init_solutions, init_values,
                     opts, T_max, do_sample=True, save=save_full_trace,
+                    save_restart_traces=bool(getattr(opts, "save_restart_traces", False)),
                 )
             batch_times.append(float(time.time() - t0))
 
@@ -583,9 +689,6 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         best_value = torch.cat(best_value_chunks, 0)  # (N,1)
         improvement = torch.cat(improvement_chunks, 0)  # (N,T)
         reward = torch.cat(reward_chunks, 0)  # (N,T)
-
-        if save_full_trace:
-            all_history[tag] = batch_histories
 
         total_time_s = float(sum(batch_times))
         total_instances = int(sum(batch_sizes))
@@ -630,8 +733,9 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
 
         if save_full_trace and (opts.save_dir is not None):
             os.makedirs(opts.save_dir, exist_ok=True)
-            save_path = os.path.join(opts.save_dir, f"{tag}_{init_method}Init_seed{opts.seed}.pkl")
+            restart_suffix = f"_x{restarts}" if restarts > 1 else ""
+            save_path = os.path.join(opts.save_dir, f"{tag}_{init_method}Init{restart_suffix}_seed{opts.seed}.pkl")
             with open(save_path, "wb") as f:
-                pickle.dump(all_history, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump({tag: batch_histories}, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     return val_metrics
