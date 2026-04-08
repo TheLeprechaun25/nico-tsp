@@ -21,6 +21,8 @@ python run.py \
   --batch_size 256 \
   --il_size_range 10 20 \
   --rl_size_range 10 20 \
+  --update_old_model_every_batch \
+  --update_old_model_freq 20 \
   --epoch_schedule IL:100,RL:200 \
   --save \
   --run_id NICO20
@@ -38,6 +40,8 @@ python run.py \
   --batch_size 256 \
   --il_size_range 20 50 \
   --rl_size_range 20 100 \
+  --update_old_model_every_batch \
+  --update_old_model_freq 20 \
   --epoch_schedule IL:100,RL:200 \
   --save \
   --run_id NICO100
@@ -128,7 +132,7 @@ python run.py \
 
 ## Notes
 
-* `--epoch_schedule IL:100,RL:400` denotes two-stage training with **100 imitation-learning epochs** followed by **400 reinforcement-learning epochs**.
+* `--epoch_schedule IL:100,RL:200` denotes two-stage training with **100 imitation-learning epochs** followed by **200 reinforcement-learning epochs**.
 * `--T_max_eval_mult 10` evaluates each instance with a search budget of **10n improvement steps**.
 * `--eval_restarts k` runs NICO from `k` independent initial solutions and keeps the best result.
 * `--eval_init_method load` allows NICO to refine tours produced by an external method.

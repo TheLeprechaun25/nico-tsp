@@ -30,7 +30,7 @@ def get_options(args=None):
     parser.add_argument('--batch_size', type=int, default=256, help='Fallback training batch size used by IL/RL when stage-specific batch sizes are not set')
     parser.add_argument('--il_batch_size', type=int, default=None, help='Batch size for imitation learning (defaults to --batch_size)')
     parser.add_argument('--rl_batch_size', type=int, default=None, help='Batch size for reinforcement/mixed training (defaults to --batch_size)')
-    parser.add_argument('--epoch_size', type=int, default=512000, help='Number of instances per epoch during training')
+    parser.add_argument('--epoch_size', type=int, default=128000, help='Number of instances per epoch during training')
     parser.add_argument('--lr_model', type=float, default=1e-4, help="Set the learning rate ")
     parser.add_argument('--start_lr', type=float, default=None,
                         help='Force optimizer LR at the start of this run (overrides checkpoint LR if resuming).')
@@ -53,10 +53,10 @@ def get_options(args=None):
     parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
     parser.add_argument('--ppo_clip', type=float, default=0.2, help='PPO clip ratio')
     parser.add_argument('--grpo_group_size', type=int, default=20, help='Group size for GRPO (1 to disable)')
-    parser.add_argument('--rl_group_rotations', type=int, default=1,
+    parser.add_argument('--rl_group_rotations', type=int, default=5,
                         help='Number of evenly spaced coordinate rotations to instantiate within each RL group. '
                              'Must divide the effective GRPO group size. 1 disables rotation augmentation.')
-    parser.add_argument('--rl_rotation_consistency_coef', type=float, default=0.0,
+    parser.add_argument('--rl_rotation_consistency_coef', type=float, default=0.03,
                         help='Coefficient for the RL rotation-consistency regularizer. '
                              '0 disables the auxiliary loss and preserves the current objective.')
     parser.add_argument('--init_cost_ref', type=str, default='warmup_best', choices=['warmup_best', 'warmup_last'], help='Reference cost for reward normalization')
