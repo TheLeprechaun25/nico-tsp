@@ -48,11 +48,11 @@ def get_options(args=None):
 
     # Reinforcement Learning
     parser.add_argument('--num_rl_epochs', type=int, default=200, help='The number of RL epochs to train')
-    parser.add_argument('--rl_horizon', type=int, default=4, help='Number of steps to unroll for each RL training instance (trajectory length)')
+    parser.add_argument('--rl_horizon', type=int, default=32, help='Number of steps to unroll for each RL training instance (trajectory length)')
 
     parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
     parser.add_argument('--ppo_clip', type=float, default=0.2, help='PPO clip ratio')
-    parser.add_argument('--grpo_group_size', type=int, default=10, help='Group size for GRPO (1 to disable)')
+    parser.add_argument('--grpo_group_size', type=int, default=20, help='Group size for GRPO (1 to disable)')
     parser.add_argument('--rl_group_rotations', type=int, default=1,
                         help='Number of evenly spaced coordinate rotations to instantiate within each RL group. '
                              'Must divide the effective GRPO group size. 1 disables rotation augmentation.')
