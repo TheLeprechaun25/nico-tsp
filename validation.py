@@ -1,8 +1,10 @@
 import os
 import time
 import pickle
+import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from utils import move_to, get_inner_model
@@ -40,9 +42,54 @@ class RolloutRecorder:
 
     def finalize(self):
         if self.save:
-            return {"events": self.hist.events, "costs": self.hist.best_costs, "times": self.hist.times}
+            costs = None
+            if self.hist.best_costs is not None:
+                costs = np.asarray(self.hist.best_costs, dtype=np.float32)
+
+            times = None
+            if self.hist.times is not None:
+                times = np.asarray(self.hist.times, dtype=np.float32)
+
+            return {"events": self.hist.events, "costs": costs, "times": times}
         else:
             return None
+
+
+def _attach_trace_metadata(hist: Optional[Dict[str, Any]], trace_type: str, num_restarts: int) -> Optional[Dict[str, Any]]:
+    if hist is None:
+        return None
+    payload = dict(hist)
+    payload["trace_type"] = str(trace_type)
+    payload["num_restarts"] = int(num_restarts)
+    return payload
+
+
+def _split_parallel_history_by_restart(hist_big: Optional[Dict[str, Any]], K: int, B: int) -> Optional[List[Dict[str, Any]]]:
+    if hist_big is None:
+        return None
+
+    times = hist_big.get("times")
+    costs_big = hist_big.get("costs")
+    events_big = hist_big.get("events")
+    out: List[Dict[str, Any]] = []
+
+    for k in range(K):
+        lo = k * B
+        hi = (k + 1) * B
+        costs_k = None if costs_big is None else costs_big[:, lo:hi].copy()
+        events_k = None if events_big is None else events_big[lo:hi]
+        out.append(
+            {
+                "restart_index": int(k),
+                "trace_type": "restart",
+                "num_restarts": int(K),
+                "events": events_k,
+                "costs": costs_k,
+                "times": times,
+            }
+        )
+
+    return out
 
 
 # =========================
@@ -56,6 +103,7 @@ def envelope_min(v_big: torch.Tensor, K: int, B: int) -> torch.Tensor:
 
 
 _CONCORDE_OPT_CACHE: Dict[str, Optional[torch.Tensor]] = {}
+_GRAPH_TAG_RE = re.compile(r"(unif|tsplib)\d+")
 
 
 def _load_concorde_opt_costs(graph_type: str, graph_size: int, num_instances: int) -> Optional[torch.Tensor]:
@@ -104,6 +152,55 @@ def _load_concorde_opt_costs(graph_type: str, graph_size: int, num_instances: in
     if opt_all is None:
         return None
     return opt_all[:num_instances]
+
+
+def _resolve_eval_init_path(raw_path: str, graph_type: str, graph_size: int) -> str:
+    """
+    Resolves a per-tag init path for validation.
+    Supported patterns:
+      - explicit templates: .../{graph_type}{graph_size}.pkl or .../{tag}.npz
+      - implicit tag rewrite: a path containing one graph tag such as "unif500"
+        will be rewritten to the current validation tag if a matching sibling file exists
+    """
+    raw_path = os.path.expanduser(str(raw_path))
+    tag = f"{graph_type}{graph_size}"
+
+    templated = (
+        raw_path
+        .replace("{graph_type}", str(graph_type))
+        .replace("{graph_size}", str(graph_size))
+        .replace("{tag}", tag)
+    )
+    if templated != raw_path:
+        return templated
+
+    matches = list(_GRAPH_TAG_RE.finditer(raw_path))
+    if not matches:
+        return raw_path
+
+    if any(m.group(0) == tag for m in matches):
+        return raw_path
+
+    for m in reversed(matches):
+        candidate = raw_path[:m.start()] + tag + raw_path[m.end():]
+        if os.path.exists(candidate):
+            return candidate
+
+    candidate = raw_path[:matches[-1].start()] + tag + raw_path[matches[-1].end():]
+    if os.path.exists(raw_path):
+        raise FileNotFoundError(
+            f"eval_init_path='{raw_path}' does not match validation tag '{tag}', and auto-resolved "
+            f"candidate '{candidate}' does not exist. Use a per-tag path template such as '{{tag}}' "
+            f"or provide matching init files for each validation dataset."
+        )
+    return candidate
+
+
+def _eval_time_budget_s(opts, graph_size: int) -> Optional[float]:
+    budget_mult = float(getattr(opts, "eval_time_budget_s_mult", 0.0))
+    if budget_mult <= 0:
+        return None
+    return budget_mult * float(graph_size)
 
 
 def _get_tabu_cfg(opts) -> Dict[str, Any]:
@@ -348,6 +445,7 @@ def rollout_plain(
     value: torch.Tensor,      # (B,)
     opts,
     T: int,
+    time_budget_s: Optional[float],
     do_sample: bool,
     save: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
@@ -371,6 +469,9 @@ def rollout_plain(
 
     improvements, rewards = [], []
     for t in range(1, T + 1):
+        if time_budget_s is not None and (time.time() - start_t) >= time_budget_s:
+            break
+
         logits_all = inner(
             x=coords,
             solutions=sol,
@@ -402,8 +503,15 @@ def rollout_plain(
 
         rec.record_step(t, time.time() - start_t, best_report, improved)
 
-    hist = rec.finalize()
-    return best_report.view(-1, 1), torch.stack(improvements, 1), torch.stack(rewards, 1), hist
+    if improvements:
+        improvement_tensor = torch.stack(improvements, 1)
+        reward_tensor = torch.stack(rewards, 1)
+    else:
+        improvement_tensor = torch.empty(B, 0, device=best_report.device, dtype=best_report.dtype)
+        reward_tensor = torch.empty(B, 0, device=best_report.device, dtype=best_report.dtype)
+
+    hist = _attach_trace_metadata(rec.finalize(), trace_type="plain", num_restarts=1)
+    return best_report.view(-1, 1), improvement_tensor, reward_tensor, hist
 
 
 @torch.no_grad()
@@ -415,8 +523,10 @@ def rollout_multistart_parallel_envelope(
     init_values: List[torch.Tensor],    # K x (B,)
     opts,
     T: int,
+    time_budget_s: Optional[float],
     do_sample: bool,
     save: bool,
+    save_restart_traces: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """
     Runs K starts in parallel by expanding batch to (K*B).
@@ -442,14 +552,24 @@ def rollout_multistart_parallel_envelope(
     env_best = envelope_min(best_big, K, B)
 
     rec = RolloutRecorder(B=B, save=save)
+    restart_rec = RolloutRecorder(B=K * B, save=save and save_restart_traces)
     inner = get_inner_model(model)
 
     start_t = time.time()
     rec.record_step(0, time.time() - start_t, env_best, torch.zeros(B, device=opts.device, dtype=torch.bool))
+    restart_rec.record_step(
+        0,
+        time.time() - start_t,
+        best_big,
+        torch.zeros(K * B, device=opts.device, dtype=torch.bool),
+    )
 
     improvements, rewards = [], []
 
     for t in range(1, T + 1):
+        if time_budget_s is not None and (time.time() - start_t) >= time_budget_s:
+            break
+
         logits_all = inner(
             x=coords_big,
             solutions=sol_big,
@@ -467,6 +587,7 @@ def rollout_multistart_parallel_envelope(
         obj_big = problem.get_costs(coords_big, sol_big)
 
         cost_big = obj_big
+        best_big_prev = best_big
         best_big = torch.minimum(best_big, obj_big)
 
         env_cost_new = envelope_min(cost_big, K, B)
@@ -482,9 +603,20 @@ def rollout_multistart_parallel_envelope(
         _update_tabu_state(tabu_state, tabu_cfg, prev_sol_big, exchange)
 
         rec.record_step(t, time.time() - start_t, env_best, improved)
+        restart_rec.record_step(t, time.time() - start_t, best_big, best_big < best_big_prev)
 
-    hist = rec.finalize()
-    return env_best.view(-1, 1), torch.stack(improvements, 1), torch.stack(rewards, 1), hist
+    if improvements:
+        improvement_tensor = torch.stack(improvements, 1)
+        reward_tensor = torch.stack(rewards, 1)
+    else:
+        improvement_tensor = torch.empty(B, 0, device=env_best.device, dtype=env_best.dtype)
+        reward_tensor = torch.empty(B, 0, device=env_best.device, dtype=env_best.dtype)
+
+    hist = _attach_trace_metadata(rec.finalize(), trace_type="multistart_envelope", num_restarts=K)
+    restart_hist = restart_rec.finalize()
+    if hist is not None and restart_hist is not None:
+        hist["restart_traces"] = _split_parallel_history_by_restart(restart_hist, K=K, B=B)
+    return env_best.view(-1, 1), improvement_tensor, reward_tensor, hist
 
 
 # =========================
@@ -493,7 +625,6 @@ def rollout_multistart_parallel_envelope(
 def validate(problem, model, val_datasets, opts, save_full_trace=False):
     model.eval()
     val_metrics: Dict[str, float] = {}
-    all_history: Dict[str, Any] = {}
 
     eval_bs = int(getattr(opts, "eval_batch_size", 1))
 
@@ -504,14 +635,18 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         problem.size = int(graph_size)
         problem.graph_type = str(graph_type)
         T_max = int(getattr(opts, "T_max_eval_mult", 1.0) * graph_size)
+        tag_time_budget_s = _eval_time_budget_s(opts, int(graph_size))
 
         restarts = max(1, int(getattr(opts, "eval_restarts", 1)))
         init_method = str(getattr(opts, "eval_init_method", "sequential")).lower()
 
         load_path = None
         if init_method == "load":
-            load_path = getattr(opts, "eval_init_path", None)
-            assert load_path is not None, "opts.eval_init_path must be set when eval_init_method='load'"
+            raw_load_path = getattr(opts, "eval_init_path", None)
+            assert raw_load_path is not None, "opts.eval_init_path must be set when eval_init_method='load'"
+            load_path = _resolve_eval_init_path(raw_load_path, str(graph_type), int(graph_size))
+            if getattr(opts, "verbose", False) and load_path != os.path.expanduser(str(raw_load_path)):
+                print(f"[{tag}] resolved eval init path: {load_path}")
 
         batch_offset = 0
         batch_times: List[float] = []
@@ -524,8 +659,16 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         batch_histories: List[Dict[str, Any]] = []
 
         loader = DataLoader(val_dataset, batch_size=eval_bs, shuffle=False, pin_memory=True)
+        tag_start_t = time.time()
 
         for batch in loader:
+            batch_time_budget_s = None
+            if tag_time_budget_s is not None:
+                elapsed_tag_s = time.time() - tag_start_t
+                batch_time_budget_s = tag_time_budget_s - elapsed_tag_s
+                if batch_time_budget_s <= 0:
+                    break
+
             coords = move_to(batch["coords"], opts.device)  # coords-only
             B = int(coords.size(0))
             batch_sizes.append(B)
@@ -562,13 +705,14 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
                 bv, imp, r, hist = rollout_plain(
                     problem, model,
                     coords, init_solutions[0], init_values[0],
-                    opts, T_max, do_sample=True, save=save_full_trace,
+                    opts, T_max, batch_time_budget_s, do_sample=True, save=save_full_trace,
                 )
             else:
                 bv, imp, r, hist = rollout_multistart_parallel_envelope(
                     problem, model,
                     coords, init_solutions, init_values,
-                    opts, T_max, do_sample=True, save=save_full_trace,
+                    opts, T_max, batch_time_budget_s, do_sample=True, save=save_full_trace,
+                    save_restart_traces=bool(getattr(opts, "save_restart_traces", False)),
                 )
             batch_times.append(float(time.time() - t0))
 
@@ -584,13 +728,12 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
         improvement = torch.cat(improvement_chunks, 0)  # (N,T)
         reward = torch.cat(reward_chunks, 0)  # (N,T)
 
-        if save_full_trace:
-            all_history[tag] = batch_histories
-
         total_time_s = float(sum(batch_times))
         total_instances = int(sum(batch_sizes))
         avg_time_s = total_time_s / max(1, total_instances)
         steps_per_instance = int(reward.size(1)) if reward.dim() >= 2 else 0
+        avg_reward = float(reward.mean().item()) if reward.numel() > 0 else 0.0
+        avg_improvement = float(improvement.mean().item()) if improvement.numel() > 0 else 0.0
 
         best_flat = best_value.view(-1).float()
         best_mean = float(best_flat.mean().item())
@@ -611,8 +754,13 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
             init_str = f"init: {init_method}"
             if restarts > 1:
                 init_str += f" | parallel inits: {restarts}"
+            if tag_time_budget_s is not None:
+                init_str += f" | time budget: {tag_time_budget_s:.3f}s"
+            count_str = str(total_instances)
+            if total_instances != len(val_dataset):
+                count_str = f"{total_instances}/{len(val_dataset)}"
             print(
-                f"[{tag}: {total_instances}] avg cost: {best_mean:.6f} +- {best_std:.6f} | "
+                f"[{tag}: {count_str}] avg cost: {best_mean:.6f} +- {best_std:.6f} | "
                 f"gap to optimal: {gap_str} | "
                 f"{init_str} | "
                 f"steps: {steps_per_instance}/inst | "
@@ -621,17 +769,21 @@ def validate(problem, model, val_datasets, opts, save_full_trace=False):
             )
 
         val_metrics[f"val_{tag}/best_cost_mean"] = best_mean
-        val_metrics[f"val_{tag}/avg_reward"] = reward.mean().item()
-        val_metrics[f"val_{tag}/avg_improvement_per_step"] = improvement.mean().item()
+        val_metrics[f"val_{tag}/avg_reward"] = avg_reward
+        val_metrics[f"val_{tag}/avg_improvement_per_step"] = avg_improvement
         val_metrics[f"val_{tag}/total_time_s"] = total_time_s
         val_metrics[f"val_{tag}/avg_time_s"] = avg_time_s
+        val_metrics[f"val_{tag}/evaluated_instances"] = float(total_instances)
+        if tag_time_budget_s is not None:
+            val_metrics[f"val_{tag}/eval_time_budget_s"] = float(tag_time_budget_s)
         if gap_to_opt_pct is not None:
             val_metrics[f"val_{tag}/gap_to_optimal_pct"] = gap_to_opt_pct
 
         if save_full_trace and (opts.save_dir is not None):
             os.makedirs(opts.save_dir, exist_ok=True)
-            save_path = os.path.join(opts.save_dir, f"{tag}_{init_method}Init_seed{opts.seed}.pkl")
+            restart_suffix = f"_x{restarts}" if restarts > 1 else ""
+            save_path = os.path.join(opts.save_dir, f"{tag}_{init_method}Init{restart_suffix}_seed{opts.seed}.pkl")
             with open(save_path, "wb") as f:
-                pickle.dump(all_history, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump({tag: batch_histories}, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     return val_metrics

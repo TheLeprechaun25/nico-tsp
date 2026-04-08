@@ -985,8 +985,10 @@ def train_il_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
     denom = max(1, n_updates)
     train_metrics = {k: float(v / denom) for k, v in acc.items()}
 
-    model.eval()
-    val_metrics = validate(problem, get_inner_model(model), val_datasets, opts)
+    val_metrics = {}
+    if not getattr(opts, "skip_train_validation", False):
+        model.eval()
+        val_metrics = validate(problem, get_inner_model(model), val_datasets, opts)
 
     epoch_results = {
         "epoch": int(epoch),

@@ -9,15 +9,69 @@ python run.py --use_wandb --no_progress_bar --sizes_per_update 1 --batch_size 25
 ### NICO with n=100
 python run.py --use_wandb --no_progress_bar --sizes_per_update 1 --batch_size 256 --il_size_range 20 50 --rl_size_range 20 100 --epoch_schedule IL:100,RL:400 --save --run_id NICO100
 
-python run.py --tabu_mode added_edges --use_added_edge_hist_feats --use_wandb --no_progress_bar --sizes_per_update 1 --batch_size 256 --il_size_range 20 50 --rl_size_range 20 100 --epoch_schedule IL:100,RL:400 --save --run_id NICO100_edgetabu
-
-### Notes
-
-- `--epoch_schedule` overrides `--num_il_epochs` and `--num_rl_epochs`.
-- A single-stage schedule such as `IL:100` or `RL:400` is valid.
-
 
 ## How to test
-python run.py --eval_only --load_path /path/to/model.pt
 
-python run.py --eval_only --verbose --T_max_eval_mult 10 --load_path outputs/nico100/rl_epoch-110.pt
+### NICO100 x1
+
+python run.py \
+  --eval_only \
+  --verbose \
+  --load_path outputs/508-215-nico100/rl_epoch-160.pt \
+  --val_graph_types unif unif unif unif tsplib \
+  --val_graph_sizes 20 50 100 500 100 \
+  --num_val_samples 100 100 100 100 100 \
+  --T_max_eval_mult 10 \
+  --save_full_trace \
+  --save_restart_traces \
+  --save_dir results/nico
+
+### NICO100 x8
+
+python run.py \
+  --eval_only \
+  --verbose \
+  --load_path outputs/508-215-nico100/rl_epoch-160.pt \
+  --eval_init_method random \
+  --eval_restarts 8 \
+  --val_graph_types unif unif unif unif tsplib \
+  --val_graph_sizes 20 50 100 500 100 \
+  --num_val_samples 100 100 100 100 100 \
+  --T_max_eval_mult 10 \
+  --save_full_trace \
+  --save_restart_traces \
+  --save_dir results/nico
+
+### NICO100 x32
+
+python run.py \
+  --eval_only \
+  --verbose \
+  --load_path outputs/508-215-nico100/rl_epoch-160.pt \
+  --eval_init_method random \
+  --eval_restarts 32 \
+  --val_graph_types unif unif unif unif tsplib \
+  --val_graph_sizes 20 50 100 500 100 \
+  --num_val_samples 100 100 100 100 100 \
+  --T_max_eval_mult 10 \
+  --save_full_trace \
+  --save_restart_traces \
+  --save_dir results/nico
+
+
+
+### NICO100 with loaded initial solutions - POMO
+
+python run.py \
+  --eval_only \
+  --verbose \
+  --load_path outputs/508-215-nico100/rl_epoch-160.pt \
+  --eval_init_method load \
+  --eval_init_path 'results/pomo/anytime_results_policyN100_{tag}_seed55.pkl' \
+  --val_graph_types unif unif unif tsplib
+  --val_graph_sizes 50 100 500 100
+  --num_val_samples 100 100 100 100
+  --T_max_eval_mult 10 \
+  --save_full_trace \
+  --save_dir results/nico/pomo_load
+

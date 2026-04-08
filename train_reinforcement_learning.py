@@ -1,9 +1,11 @@
 import math, copy, os, random
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 import torch
 from tqdm import tqdm
 
+from problem_tsp import TSP
 from validation import (
     validate,
     _get_tabu_cfg,
@@ -46,6 +48,25 @@ class SegmentBatch:
 # =============================================================
 # Competition-style rewards / advantages
 # =============================================================
+def _build_reward_score_trace(
+    init_cost: torch.Tensor,         # (B_eff,)
+    best_cost_t: torch.Tensor,       # (T, B_eff)
+    reward_norm: str,
+) -> torch.Tensor:
+    reward_norm = str(reward_norm).lower()
+
+    if reward_norm == "rel_init":
+        denom = init_cost.clamp_min(1e-6).unsqueeze(0)
+        return (init_cost.unsqueeze(0) - best_cost_t).clamp_min(0.0) / denom
+
+    if reward_norm == "rel_current":
+        prev_best_t = torch.cat([init_cost.unsqueeze(0), best_cost_t[:-1]], dim=0)
+        step_gain = (prev_best_t - best_cost_t).clamp_min(0.0) / prev_best_t.clamp_min(1e-6)
+        return torch.cumsum(step_gain, dim=0)
+
+    raise ValueError(f"Unsupported rl_reward_norm '{reward_norm}'")
+
+
 def compute_reward_returns_advantages(
     init_cost: torch.Tensor,                 # (B_eff,)
     best_cost_t: torch.Tensor,               # (T, B_eff)
@@ -54,16 +75,13 @@ def compute_reward_returns_advantages(
     B_eff: int,
     T: int,
     G: int,
+    reward_norm: str = "rel_init",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     device = init_cost.device
     assert B_eff == B_base * G
 
-    best_cost_full = best_cost_t[-1]
-    denom_eff = init_cost.clamp_min(1e-6)  # (B_eff,)
-
-    denom_bg = denom_eff.view(B_base, G)  # (B_base,G)
-    score_full = (init_cost - best_cost_full).clamp_min(0.0) / denom_eff
-
+    score_trace = _build_reward_score_trace(init_cost, best_cost_t, reward_norm=reward_norm)
+    score_full = score_trace[-1]
     score_bg_full = score_full.view(B_base, G)
 
     bt_bg = best_time.view(B_base, G)
@@ -83,17 +101,14 @@ def compute_reward_returns_advantages(
 
     frac_best_mean = float(winners_mask.float().mean(dim=1).mean().detach().item())
 
-    init_cost_bg = init_cost.view(B_base, G)
     t_star_idx = torch.where(t_star >= 0, t_star, torch.zeros_like(t_star)).long()
 
-    best_cost_t_bg = best_cost_t.view(T, B_base, G)
+    score_trace_bg = score_trace.view(T, B_base, G)
     gather_idx = t_star_idx.view(1, B_base, 1).expand(1, B_base, G)
-    best_cost_cut_bg = best_cost_t_bg.gather(dim=0, index=gather_idx).squeeze(0)
+    score_bg = score_trace_bg.gather(dim=0, index=gather_idx).squeeze(0)
 
     no_credit = (t_star < 0).view(B_base, 1)
-    best_cost_cut_bg = torch.where(no_credit, init_cost_bg, best_cost_cut_bg)
-
-    score_bg = (init_cost_bg - best_cost_cut_bg).clamp_min(0.0) / denom_bg
+    score_bg = torch.where(no_credit, torch.zeros_like(score_bg), score_bg)
 
     t_idx = torch.arange(T, device=device).view(T, 1, 1)
     mask_bg = (t_idx <= t_star.view(1, B_base, 1))
@@ -128,6 +143,250 @@ def _index_tabu_state(tabu_state: Dict[str, torch.Tensor], idx: torch.Tensor) ->
 def _scatter_tabu_state(tabu_state: Dict[str, torch.Tensor], idx: torch.Tensor, sub_state: Dict[str, torch.Tensor]) -> None:
     tabu_state["action_hist"][idx] = sub_state["action_hist"]
     tabu_state["edge_hist"][idx] = sub_state["edge_hist"]
+
+
+def _expand_group_tensor(x: torch.Tensor, num_rotations: int, repeats_per_rotation: int) -> torch.Tensor:
+    B_base = int(x.size(0))
+    return (
+        x.unsqueeze(1)
+        .unsqueeze(2)
+        .expand(B_base, num_rotations, repeats_per_rotation, *x.shape[1:])
+        .contiguous()
+        .view(B_base * num_rotations * repeats_per_rotation, *x.shape[1:])
+    )
+
+
+def _expand_group_rollout_state(
+    problem,
+    coords_base: torch.Tensor,
+    sol_base: torch.Tensor,
+    best_base: torch.Tensor,
+    init_cost_base: torch.Tensor,
+    lastk_base: torch.Tensor,
+    tabu_state_base: Dict[str, torch.Tensor],
+    group_size: int,
+    num_rotations: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], int]:
+    B_base, N, _ = coords_base.size()
+    G = max(1, int(group_size))
+    R = max(1, int(num_rotations))
+
+    if R > G:
+        raise ValueError(f"rl_group_rotations ({R}) must be <= effective group size ({G})")
+    if G % R != 0:
+        raise ValueError(f"effective group size ({G}) must be divisible by rl_group_rotations ({R})")
+
+    if G == 1:
+        tabu_state = {
+            "action_hist": tabu_state_base["action_hist"],
+            "edge_hist": tabu_state_base["edge_hist"],
+        }
+        return coords_base, sol_base, best_base, init_cost_base, lastk_base, tabu_state, G
+
+    if R == 1:
+        coords = coords_base.unsqueeze(1).expand(B_base, G, N, 2).contiguous().view(B_base * G, N, 2)
+        sol = sol_base.unsqueeze(1).expand(B_base, G, N).contiguous().view(B_base * G, N)
+        best = best_base.unsqueeze(1).expand(B_base, G).contiguous().view(B_base * G)
+        init_cost = init_cost_base.unsqueeze(1).expand(B_base, G).contiguous().view(B_base * G)
+        K_hist = int(lastk_base.size(1))
+        lastk = lastk_base.unsqueeze(1).expand(B_base, G, K_hist, 2).contiguous().view(B_base * G, K_hist, 2)
+        aK = int(tabu_state_base["action_hist"].size(1))
+        eK = int(tabu_state_base["edge_hist"].size(1))
+        tabu_state = {
+            "action_hist": tabu_state_base["action_hist"].unsqueeze(1).expand(B_base, G, aK, 2).contiguous().view(B_base * G, aK, 2),
+            "edge_hist": tabu_state_base["edge_hist"].unsqueeze(1).expand(B_base, G, eK, 2).contiguous().view(B_base * G, eK, 2),
+        }
+        return coords, sol, best, init_cost, lastk, tabu_state, G
+
+    repeats_per_rotation = G // R
+    coords_rot = problem.rotate_coords_evenly(coords_base, R)  # (B_base, R, N, 2)
+    coords = (
+        coords_rot.unsqueeze(2)
+        .expand(B_base, R, repeats_per_rotation, N, 2)
+        .contiguous()
+        .view(B_base * G, N, 2)
+    )
+    sol = _expand_group_tensor(sol_base, R, repeats_per_rotation)
+    best = _expand_group_tensor(best_base, R, repeats_per_rotation)
+    init_cost = _expand_group_tensor(init_cost_base, R, repeats_per_rotation)
+    lastk = _expand_group_tensor(lastk_base, R, repeats_per_rotation)
+    tabu_state = {
+        "action_hist": _expand_group_tensor(tabu_state_base["action_hist"], R, repeats_per_rotation),
+        "edge_hist": _expand_group_tensor(tabu_state_base["edge_hist"], R, repeats_per_rotation),
+    }
+    return coords, sol, best, init_cost, lastk, tabu_state, G
+
+
+def _rotation_consistency_loss_for_step(
+    model,
+    coords_t: torch.Tensor,
+    sol_t: torch.Tensor,
+    lastk_t: torch.Tensor,
+    tabu_action_hist_t: torch.Tensor,
+    tabu_edge_hist_t: torch.Tensor,
+    base_batch_size: int,
+    group_size: int,
+    num_rotations: int,
+    opts,
+) -> torch.Tensor:
+    B_eff, N, _ = coords_t.size()
+    B_base = int(base_batch_size)
+    G = int(group_size)
+    R = max(1, int(num_rotations))
+
+    if R <= 1 or G <= 1:
+        return torch.zeros((), device=coords_t.device, dtype=torch.float32)
+    if G % R != 0:
+        raise ValueError(f"group_size ({G}) must be divisible by num_rotations ({R})")
+    if B_eff != B_base * G:
+        raise ValueError(f"Expected B_eff={B_base * G}, got {B_eff}")
+
+    repeats_per_rotation = G // R
+
+    coords_group = coords_t.reshape(B_base, R, repeats_per_rotation, N, 2)
+    sol_group = sol_t.reshape(B_base, R, repeats_per_rotation, N)
+    K_hist = int(lastk_t.size(1))
+    lastk_group = lastk_t.reshape(B_base, R, repeats_per_rotation, K_hist, 2)
+    action_hist_len = int(tabu_action_hist_t.size(1))
+    edge_hist_len = int(tabu_edge_hist_t.size(1))
+    tabu_action_group = tabu_action_hist_t.reshape(B_base, R, repeats_per_rotation, action_hist_len, 2)
+    tabu_edge_group = tabu_edge_hist_t.reshape(B_base, R, repeats_per_rotation, edge_hist_len, 2)
+
+    coords_anchor = coords_group[:, 0].contiguous().reshape(B_base * repeats_per_rotation, N, 2)
+    sol_anchor = sol_group[:, 0].contiguous().reshape(B_base * repeats_per_rotation, N)
+    lastk_anchor = lastk_group[:, 0].contiguous().reshape(B_base * repeats_per_rotation, K_hist, 2)
+    tabu_action_anchor = tabu_action_group[:, 0].contiguous().reshape(B_base * repeats_per_rotation, action_hist_len, 2)
+    tabu_edge_anchor = tabu_edge_group[:, 0].contiguous().reshape(B_base * repeats_per_rotation, edge_hist_len, 2)
+
+    coords_rot = TSP.rotate_coords_evenly(coords_anchor, R)
+    coords_aux = coords_rot.contiguous().reshape(B_base * G, N, 2)
+    sol_aux = sol_anchor.unsqueeze(1).expand(B_base * repeats_per_rotation, R, N).contiguous().reshape(B_base * G, N)
+    lastk_aux = lastk_anchor.unsqueeze(1).expand(B_base * repeats_per_rotation, R, K_hist, 2).contiguous().reshape(B_base * G, K_hist, 2)
+    tabu_action_aux = (
+        tabu_action_anchor.unsqueeze(1)
+        .expand(B_base * repeats_per_rotation, R, action_hist_len, 2)
+        .contiguous()
+        .reshape(B_base * G, action_hist_len, 2)
+    )
+    tabu_edge_aux = (
+        tabu_edge_anchor.unsqueeze(1)
+        .expand(B_base * repeats_per_rotation, R, edge_hist_len, 2)
+        .contiguous()
+        .reshape(B_base * G, edge_hist_len, 2)
+    )
+
+    with autocast_context(opts):
+        logits_all = model(
+            coords_aux,
+            sol_aux,
+            last_k_actions=lastk_aux,
+            tabu_edge_hist=tabu_edge_aux,
+        )
+    if logits_all.dim() == 3:
+        logits_all = logits_all.view(B_base * G, -1)
+
+    tabu_cfg = _get_tabu_cfg(opts)
+    tabu_state_aux = {
+        "action_hist": tabu_action_aux,
+        "edge_hist": tabu_edge_aux,
+    }
+    masked_logits = _apply_tabu_mask(logits_all, sol_aux, tabu_state_aux, tabu_cfg)
+    masked_logits = masked_logits.to(torch.float32).reshape(B_base * repeats_per_rotation, R, -1)
+
+    has_nan = torch.isnan(masked_logits).any(dim=-1)
+    has_any_finite = torch.isfinite(masked_logits).any(dim=-1)
+    valid_groups = (~has_nan).all(dim=1) & has_any_finite.all(dim=1)
+    if not bool(valid_groups.any()):
+        return torch.zeros((), device=coords_t.device, dtype=torch.float32)
+
+    masked_logits = masked_logits[valid_groups]
+    logp = torch.log_softmax(masked_logits, dim=-1)
+    probs = logp.exp()
+
+    mean_probs = probs.mean(dim=1)
+    log_mean_probs = torch.log(mean_probs.clamp_min(1e-12))
+    js_terms = torch.xlogy(probs, probs.clamp_min(1e-12)) - probs * log_mean_probs.unsqueeze(1)
+    js_div = js_terms.sum(dim=-1).mean()
+
+    if not torch.isfinite(js_div):
+        return torch.zeros((), device=coords_t.device, dtype=torch.float32)
+    return js_div
+
+
+def _sample_uniform_stratified_sizes(size_low: int, size_high: int, num_sizes: int) -> List[int]:
+    size_low = int(size_low)
+    size_high = int(size_high)
+    K_eff = max(0, int(num_sizes))
+    if K_eff <= 0:
+        return []
+
+    rng = max(1, int(size_high - size_low + 1))
+    sizes: List[int] = []
+    for i in range(K_eff):
+        lo = size_low + (i * rng) // K_eff
+        hi = size_low + ((i + 1) * rng) // K_eff - 1
+        hi = max(lo, hi)
+        sizes.append(random.randint(int(lo), int(hi)))
+    random.shuffle(sizes)
+    return sizes
+
+
+def _sample_power_stratified_sizes(size_low: int, size_high: int, num_sizes: int, power: float) -> List[int]:
+    size_low = int(size_low)
+    size_high = int(size_high)
+    K_eff = max(0, int(num_sizes))
+    if K_eff <= 0:
+        return []
+    if size_low == size_high:
+        return [size_low] * K_eff
+
+    sizes = list(range(size_low, size_high + 1))
+    count = float(len(sizes))
+    weights = [((n - size_low + 1) / count) ** float(power) for n in sizes]
+
+    cdf = []
+    total = 0.0
+    for w in weights:
+        total += float(w)
+        cdf.append(total)
+    inv_total = 1.0 / max(total, 1e-12)
+    cdf = [x * inv_total for x in cdf]
+    cdf[-1] = 1.0
+
+    sampled_sizes: List[int] = []
+    for i in range(K_eff):
+        u = (i + random.random()) / float(K_eff)
+        idx = bisect_left(cdf, u)
+        idx = min(idx, len(sizes) - 1)
+        sampled_sizes.append(int(sizes[idx]))
+    random.shuffle(sampled_sizes)
+    return sampled_sizes
+
+
+def _sample_power_iid_sizes(size_low: int, size_high: int, num_sizes: int, power: float) -> List[int]:
+    size_low = int(size_low)
+    size_high = int(size_high)
+    K_eff = max(0, int(num_sizes))
+    if K_eff <= 0:
+        return []
+    if size_low == size_high:
+        return [size_low] * K_eff
+
+    sizes = list(range(size_low, size_high + 1))
+    count = float(len(sizes))
+    weights = [((n - size_low + 1) / count) ** float(power) for n in sizes]
+    return [int(n) for n in random.choices(sizes, weights=weights, k=K_eff)]
+
+
+def _sample_rl_sizes(size_low: int, size_high: int, num_sizes: int, mode: str, power: float) -> List[int]:
+    mode = str(mode).lower()
+    if mode == "uniform_stratified":
+        return _sample_uniform_stratified_sizes(size_low, size_high, num_sizes)
+    if mode == "power_stratified":
+        return _sample_power_stratified_sizes(size_low, size_high, num_sizes, power)
+    if mode == "power_iid":
+        return _sample_power_iid_sizes(size_low, size_high, num_sizes, power)
+    raise ValueError(f"Unsupported rl_size_sampling mode '{mode}'")
 
 
 # =============================================================
@@ -240,26 +499,17 @@ def collect_segments_variable(
         init_cost_base = best_base.clone()
 
     # ------------------ expand to groups ------------------
-    G = int(getattr(opts, "grpo_group_size", 1))
-    if G > 1:
-        coords = coords_base.unsqueeze(1).expand(B_base, G, N, 2).contiguous().view(-1, N, 2)
-        sol = sol_base.unsqueeze(1).expand(B_base, G, N).contiguous().view(-1, N)
-        best = best_base.unsqueeze(1).expand(B_base, G).contiguous().view(-1)
-        init_cost = init_cost_base.unsqueeze(1).expand(B_base, G).contiguous().view(-1)
-        lastk = lastk_base.unsqueeze(1).expand(B_base, G, K_hist, 2).contiguous().view(B_base * G, K_hist, 2)
-        aK = int(tabu_state_base["action_hist"].size(1))
-        eK = int(tabu_state_base["edge_hist"].size(1))
-        tabu_state = {
-            "action_hist": tabu_state_base["action_hist"].unsqueeze(1).expand(B_base, G, aK, 2).contiguous().view(B_base * G, aK, 2),
-            "edge_hist": tabu_state_base["edge_hist"].unsqueeze(1).expand(B_base, G, eK, 2).contiguous().view(B_base * G, eK, 2),
-        }
-
-    else:  # G=1
-        coords, sol, best, init_cost, lastk = coords_base, sol_base, best_base, init_cost_base, lastk_base
-        tabu_state = {
-            "action_hist": tabu_state_base["action_hist"],
-            "edge_hist": tabu_state_base["edge_hist"],
-        }
+    coords, sol, best, init_cost, lastk, tabu_state, G = _expand_group_rollout_state(
+        problem,
+        coords_base=coords_base,
+        sol_base=sol_base,
+        best_base=best_base,
+        init_cost_base=init_cost_base,
+        lastk_base=lastk_base,
+        tabu_state_base=tabu_state_base,
+        group_size=getattr(opts, "grpo_group_size", 1),
+        num_rotations=getattr(opts, "rl_group_rotations", 1),
+    )
 
     B_eff = coords.size(0)
     assert B_eff == B_base * G
@@ -324,6 +574,7 @@ def collect_segments_variable(
         B_eff=B_eff,
         T=T,
         G=G,
+        reward_norm=getattr(opts, "rl_reward_norm", "rel_init"),
     )
 
     adv_bg = adv_t.view(T, B_base, G)
@@ -369,7 +620,10 @@ def ppo_loss_on_segment(model, seg: SegmentBatch, opts):
         adv = adv * adv_mask
 
     logp_new_list = []
+    rotation_consistency_terms = []
     tabu_cfg = _get_tabu_cfg(opts)
+    rotation_coef = float(getattr(opts, "rl_rotation_consistency_coef", 0.0))
+    num_rotations = max(1, int(getattr(opts, "rl_group_rotations", 1)))
 
     for t in range(T):
         sol_t = seg.solutions[t].to(device)
@@ -396,6 +650,21 @@ def ppo_loss_on_segment(model, seg: SegmentBatch, opts):
         logp_t = _logp_of_actions_from_logits(masked_logits_t, act_t, sol_t.size(1))
 
         logp_new_list.append(logp_t.to(torch.float32))
+        if rotation_coef > 0.0 and num_rotations > 1 and seg.group_size > 1:
+            rotation_consistency_terms.append(
+                _rotation_consistency_loss_for_step(
+                    model,
+                    coords_t=coords_in,
+                    sol_t=sol_t,
+                    lastk_t=lastk_t,
+                    tabu_action_hist_t=tabu_action_hist_t,
+                    tabu_edge_hist_t=tabu_edge_hist_t,
+                    base_batch_size=seg.base_batch_size,
+                    group_size=seg.group_size,
+                    num_rotations=num_rotations,
+                    opts=opts,
+                )
+            )
 
     logp_new = torch.stack(logp_new_list, dim=0)  # (T,B)
     log_ratio = logp_new - logp_old
@@ -414,10 +683,19 @@ def ppo_loss_on_segment(model, seg: SegmentBatch, opts):
 
     policy_loss_all = -min_surr.mean()
     if n_active > 0:
-        total_loss = -min_surr[active].mean()
+        policy_loss = -min_surr[active].mean()
     else:
         # no signal => no gradient contribution
-        total_loss = policy_loss_all * 0.0
+        policy_loss = policy_loss_all * 0.0
+
+    if rotation_consistency_terms:
+        rotation_consistency_loss = torch.stack(rotation_consistency_terms).mean()
+    else:
+        rotation_consistency_loss = policy_loss_all.new_zeros(())
+    if not torch.isfinite(rotation_consistency_loss):
+        rotation_consistency_loss = policy_loss_all.new_zeros(())
+
+    total_loss = policy_loss + rotation_coef * rotation_consistency_loss
 
     ratio_dev_mean = (ratio - 1.0).abs().mean()
 
@@ -433,8 +711,9 @@ def ppo_loss_on_segment(model, seg: SegmentBatch, opts):
 
     stats = {
         "train/total_loss": float(total_loss.detach().item()),
-        "train/policy_loss": float(total_loss.detach().item()),
+        "train/policy_loss": float(policy_loss.detach().item()),
         "train/policy_loss_all": float(policy_loss_all.detach().item()),
+        "train/rotation_consistency_loss": float(rotation_consistency_loss.detach().item()),
         "train/active_frac": float(f),
         "train/n_active": float(n_active),  # store as float for logging consistency
         "train/n_total": float(n_total),
@@ -482,7 +761,8 @@ def train_rl_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
         bar_format="{l_bar}{bar:20}{r_bar}{bar:-20b}",
     )
     stat_keys = [
-        "train/policy_loss", "train/policy_loss_all", "train/active_frac",
+        "train/total_loss",
+        "train/policy_loss", "train/policy_loss_all", "train/rotation_consistency_loss", "train/active_frac",
         "train/n_active", "train/n_total",
         "train/ratio_mean", "train/ratio_dev_mean",
         "train/ratio_min", "train/ratio_max",
@@ -495,8 +775,9 @@ def train_rl_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
         "train/grad_norm_post_clip",
     ]
     active_weighted_keys = {
+        "train/total_loss",
         "train/policy_loss",
-        "train/policy_loss_all", "train/policy_loss_active",
+        "train/policy_loss_all", "train/policy_loss_active", "train/rotation_consistency_loss",
         "train/ratio_mean", "train/ratio_dev_mean", "train/ratio_min", "train/ratio_max",
         "train/approx_kl", "train/clipfrac", "train/clip_used_frac", "train/clip_impact_mean",
         "train/adv_mean", "train/adv_std",
@@ -519,7 +800,9 @@ def train_rl_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
     for p in model_old.parameters():
         p.requires_grad_(False)
 
-    rng = max(1, int(size_high - size_low + 1))
+    size_sampling_mode = str(getattr(opts, "rl_size_sampling", "uniform_stratified")).lower()
+    size_sampling_power = float(getattr(opts, "rl_size_power", 2.0))
+    sampled_sizes_epoch: List[int] = []
 
     for _ in range(num_updates_target):
         remaining = total_num_episodes - n_episodes
@@ -527,14 +810,14 @@ def train_rl_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
         if K_eff <= 0:
             break
 
-        # stratified size sampling
-        sizes = []
-        for i in range(K_eff):
-            lo = size_low + (i * rng) // K_eff
-            hi = size_low + ((i + 1) * rng) // K_eff - 1
-            hi = max(lo, hi)
-            sizes.append(random.randint(int(lo), int(hi)))
-        random.shuffle(sizes)
+        sizes = _sample_rl_sizes(
+            size_low=size_low,
+            size_high=size_high,
+            num_sizes=K_eff,
+            mode=size_sampling_mode,
+            power=size_sampling_power,
+        )
+        sampled_sizes_epoch.extend(int(n) for n in sizes)
 
         seg_list: List[SegmentBatch] = []
         for n in sizes:
@@ -654,10 +937,20 @@ def train_rl_epoch(problem, model, optimizer, epoch: int, val_datasets, opts):
     train_metrics = {k: float(v / denom_updates) for k, v in acc.items()}
     train_metrics["train/size_low"] = float(size_low)
     train_metrics["train/size_high"] = float(size_high)
+    train_metrics["train/size_sampling_power"] = float(size_sampling_power)
+    if sampled_sizes_epoch:
+        train_metrics["train/sampled_size_mean"] = float(sum(sampled_sizes_epoch) / len(sampled_sizes_epoch))
+        train_metrics["train/sampled_size_min"] = float(min(sampled_sizes_epoch))
+        train_metrics["train/sampled_size_max"] = float(max(sampled_sizes_epoch))
+    else:
+        train_metrics["train/sampled_size_mean"] = float(size_low)
+        train_metrics["train/sampled_size_min"] = float(size_low)
+        train_metrics["train/sampled_size_max"] = float(size_low)
 
-    # Validation
-    model.eval()
-    val_metrics = validate(problem, get_inner_model(model), val_datasets, opts)
+    val_metrics = {}
+    if not getattr(opts, "skip_train_validation", False):
+        model.eval()
+        val_metrics = validate(problem, get_inner_model(model), val_datasets, opts)
 
     epoch_results = {
         "epoch": int(epoch),
