@@ -3,16 +3,16 @@ Neural Improvement for Combinatorial Optimization (NICO). Applied to the Traveli
 
 ## How to train
 
-### NICO with n=20
+#### NICO with n=20
 python run.py --use_wandb --no_progress_bar --sizes_per_update 1 --batch_size 256 --il_size_range 10 20 --rl_size_range 10 20 --epoch_schedule IL:100,RL:400 --save --run_id NICO20
 
-### NICO with n=100
+#### NICO with n=100
 python run.py --use_wandb --no_progress_bar --sizes_per_update 1 --batch_size 256 --il_size_range 20 50 --rl_size_range 20 100 --epoch_schedule IL:100,RL:400 --save --run_id NICO100
 
 
 ## How to test
 
-### NICO100 x1
+#### NICO100 x1
 
 python run.py \
   --eval_only \
@@ -26,7 +26,7 @@ python run.py \
   --save_restart_traces \
   --save_dir results/nico
 
-### NICO100 x8
+#### NICO100 x8
 
 python run.py \
   --eval_only \
@@ -42,7 +42,7 @@ python run.py \
   --save_restart_traces \
   --save_dir results/nico
 
-### NICO100 x32
+#### NICO100 x32
 
 python run.py \
   --eval_only \
@@ -60,7 +60,7 @@ python run.py \
 
 
 
-### NICO100 with loaded initial solutions - POMO
+#### NICO100 with loaded initial solutions - POMO
 
 python run.py \
   --eval_only \
