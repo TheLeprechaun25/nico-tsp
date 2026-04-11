@@ -5,6 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 import torch
 import pickle
+from utils import find_existing_path, iter_data_path_candidates
 
 
 class TSP(object):
@@ -297,16 +298,14 @@ class TSPDataset(Dataset):
 
         if test:
             try:
-                for p in (f"../data/tsp_{graph_type}{graph_size}_test_seed1234.pkl",
-                          f"../../data/tsp_{graph_type}{graph_size}_test_seed1234.pkl",
-                          f"../../../data/tsp_{graph_type}{graph_size}_test_seed1234.pkl"):
-                    if os.path.exists(p):
-                        with open(p, "rb") as f:
-                            data = pickle.load(f)
-                        self.coords = torch.as_tensor(data[:num_samples], dtype=torch.float32)
-                        break
-                else:
+                data_path = find_existing_path(
+                    iter_data_path_candidates(f"tsp_{graph_type}{graph_size}_test_seed1234.pkl")
+                )
+                if data_path is None:
                     raise FileNotFoundError
+                with open(data_path, "rb") as f:
+                    data = pickle.load(f)
+                self.coords = torch.as_tensor(data[:num_samples], dtype=torch.float32)
             except Exception:
                 assert graph_type == "unif", "Currently only uniform graph type is supported for training data."
                 self.coords = torch.empty(num_samples, graph_size, 2).uniform_(0, 1)

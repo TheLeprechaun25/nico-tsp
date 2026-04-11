@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from utils import move_to, get_inner_model
+from utils import move_to, get_inner_model, find_existing_path, iter_data_path_candidates
 
 
 # =========================
@@ -108,34 +108,9 @@ _GRAPH_TAG_RE = re.compile(r"(unif|tsplib)\d+")
 
 def _load_concorde_opt_costs(graph_type: str, graph_size: int, num_instances: int) -> Optional[torch.Tensor]:
     folder_name = f"tsp_{graph_type}{graph_size}_test_seed1234"
-    rel_candidates = [
-        os.path.join("..", "..", "data", "results"),
-        os.path.join("..", "data", "results"),
-    ]
-    file_dir = os.path.dirname(os.path.abspath(__file__))
-    rel_candidates.extend(
-        [
-            os.path.join(file_dir, "..", "..", "data", "results"),
-            os.path.join(file_dir, "..", "data", "results"),
-        ]
+    path = find_existing_path(
+        iter_data_path_candidates("results", folder_name, "concorde_costs.pkl")
     )
-
-    # Keep candidate order stable while removing duplicates.
-    seen = set()
-    roots = []
-    for root in rel_candidates:
-        root_abs = os.path.abspath(root)
-        if root_abs in seen:
-            continue
-        seen.add(root_abs)
-        roots.append(root_abs)
-
-    path = None
-    for root in roots:
-        cand = os.path.join(root, folder_name, "concorde_costs.pkl")
-        if os.path.exists(cand):
-            path = cand
-            break
 
     if path is None:
         return None

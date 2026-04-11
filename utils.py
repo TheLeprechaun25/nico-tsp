@@ -11,6 +11,38 @@ def torch_load_cpu(load_path):
     return torch.load(load_path, map_location=lambda storage, loc: storage)  # Load on CPU
 
 
+def get_repo_root():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def iter_data_path_candidates(*relative_parts):
+    repo_root = get_repo_root()
+    cwd = os.path.abspath(os.getcwd())
+    candidate_roots = [
+        os.path.join(repo_root, "data"),
+        os.path.join(cwd, "data"),
+        os.path.abspath(os.path.join(cwd, "..", "data")),
+        os.path.abspath(os.path.join(cwd, "..", "..", "data")),
+        os.path.abspath(os.path.join(repo_root, "..", "data")),
+        os.path.abspath(os.path.join(repo_root, "..", "..", "data")),
+    ]
+
+    seen = set()
+    for root in candidate_roots:
+        candidate = os.path.abspath(os.path.join(root, *relative_parts))
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+
+def find_existing_path(candidates):
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def get_inner_model(model):
     while hasattr(model, "module"):
         model = model.module
