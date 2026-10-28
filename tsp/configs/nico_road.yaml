@@ -1,0 +1,55 @@
+# NICO-Road: RL fine-tuning of the default TSP model (tsp/configs/nico_default.yaml, checkpoints/nico_tsp.pt)
+# on road-network instances (RRNCO cities, symmetrized road distance).
+#   features  as the TSP model, with the edge lengths of every length-based feature read from the road costs
+#             (model.length_source: cost); the turning angles still come from the coordinates. Same weights,
+#             so the fine-tune starts exactly from the TSP policy.
+#   training  RL:30 (epochs of 64k instances, n in [20, 100], late starts), lr 1e-4; the released checkpoint is the
+#             epoch with the best validation cost on the validation cities (epoch 18).
+# Set the data paths on the command line:
+#   python scripts/train.py --config tsp/configs/nico_road.yaml \
+#       data.road_root=<rrnco>/data/dataset data.road_split=<rrnco_city_splits.json>
+model:
+  activation: relu
+  cycle_alpha_init: 0.1
+  cycle_mixing: true
+  delta_bias: true
+  embedding_dim: 128
+  features: geo
+  ffn_dim: 512
+  history_feature: true
+  logit_clip: 10.0
+  n_heads: 8
+  n_layers: 3
+  normalization: layer
+  coord_embed: false
+  edge_direction: false
+  len_local_scale: true
+  abs_length: false
+  reflect_invariant: true
+  length_source: cost
+output_dir: outputs
+problem: tsp
+run_name: nico_road
+data:
+  source: road
+  road_root: null
+  road_split: null
+search:
+  history_len: 16
+  tabu_tenure: 8
+train:
+  schedule: RL:30
+  epoch_size: 64000
+  lr: 1.0e-4
+  optimizer: muon_adamw
+  init_checkpoint: checkpoints/nico_tsp.pt
+  rollback_tol: 0.2
+  checkpoint_every: 2
+  val_size: 512
+  extrap_dir: data/tsp_val
+  extrap_sizes:
+  - 100
+  - 500
+  extrap_every: 2
+  rl:
+    late_start_frac: 0.5

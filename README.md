@@ -1,150 +1,84 @@
+# NICO: operator-aligned neural improvement for routing
 
-# NICO: Neural Improvement for Combinatorial Optimization
+Clean implementation of **NICO** (*Neural Improvement for Combinatorial
+Optimization*). The incumbent solution is represented by its **solution edges**
+(one token per edge, no positional encodings) with scale-free features; a gain-aware
+pairwise decoder scores 2-opt moves from the two edges they remove and their exact
+gain; the policy is trained by exact-oracle imitation followed by critic-free
+group-based RL.
 
-This repository contains the implementation of **NICO** (*Neural Improvement for Combinatorial Optimization*) applied to the **Traveling Salesperson Problem (TSP)**.
+One shared package, `nico/`, serves every problem:
 
-NICO is a neural improvement framework that learns to iteratively refine candidate tours through local search. The codebase supports both training and evaluation across multiple TSP distributions and scales, including Euclidean and TSPLIB-style instances.
+| Problem | Instances | Config | Checkpoint |
+|---|---|---|---|
+| Euclidean TSP | uniform in [0,1]² | `tsp/configs/nico_default.yaml` | `checkpoints/nico_tsp.pt` |
+| Road-network TSP | RRNCO cities, symmetrized road distance | `tsp/configs/nico_road.yaml` | `checkpoints/nico_road.pt` |
+| CVRP | uniform, Kool et al. demands/capacities | `cvrp/configs/nico_cvrp_default.yaml` | `checkpoints/nico_cvrp.pt` |
 
----
+The road model is fine-tuned from the TSP model; the CVRP model uses two operators
+(2-opt and 2-opt*) on the giant tour.
 
-## Training
-
-We provide example commands for training NICO at two target scales.
-
-### NICO-20
-Training on smaller instances with sizes up to 20:
-```bash
-python run.py \
-  --use_wandb \
-  --no_progress_bar \
-  --sizes_per_update 1 \
-  --batch_size 256 \
-  --il_size_range 10 20 \
-  --rl_size_range 10 20 \
-  --update_old_model_every_batch \
-  --update_old_model_freq 20 \
-  --epoch_schedule IL:100,RL:200 \
-  --save \
-  --run_id NICO20
-````
-
-### NICO-100
-
-Training on larger instances with sizes up to 100:
+## Install
 
 ```bash
-python run.py \
-  --use_wandb \
-  --no_progress_bar \
-  --sizes_per_update 1 \
-  --batch_size 256 \
-  --il_size_range 20 50 \
-  --rl_size_range 20 100 \
-  --update_old_model_every_batch \
-  --update_old_model_freq 20 \
-  --epoch_schedule IL:100,RL:200 \
-  --save \
-  --run_id NICO100
+pip install -e .            # torch, numpy, pyyaml, tqdm
+pip install -e ".[wandb]"   # + Weights & Biases logging
 ```
 
----
+## Layout
 
-## Evaluation
-
-The following commands reproduce the evaluation settings used for NICO at different inference-time scaling budgets.
-
-### NICO-100 (single run)
-
-```bash
-python run.py \
-  --eval_only \
-  --verbose \
-  --load_path outputs/nico100/rl_epoch-200.pt \
-  --val_graph_types unif unif unif unif tsplib \
-  --val_graph_sizes 20 50 100 500 100 \
-  --num_val_samples 100 100 100 100 100 \
-  --T_max_eval_mult 10 \
-  --save_full_trace \
-  --save_restart_traces \
-  --save_dir results/nico
+```
+nico/
+  problems/   base.py   instance dicts, tour costs, 2-opt move and delta
+              tsp.py    symmetric TSP
+              cvrp.py   giant tour with depot copies, Proposition-4 feasibility mask
+              road.py   RRNCO road-network instances (symmetrized objective)
+  features.py  edge-token features (geo, dist, cvrp, history)
+  nn.py        attention blocks, cycle mixing
+  model.py     NICOPolicy: tokenizer -> encoder -> pairwise decoder
+  search.py    search state, tabu masking, warmup, policy-driven improvement
+  oracle.py    exact K-step 2-opt oracle with set-valued targets
+  train_il.py  stage 1 (imitation)       train_rl.py  stage 2 (group RL + PPO)
+  trainer.py   two-stage driver           evaluate.py  batched evaluation with restarts
+  checkpoint.py  config-carrying checkpoints
+scripts/       train.py, evaluate.py
+tsp/, cvrp/    training configs and problem-specific notes
+checkpoints/   trained models (weights + config)
+data/          test sets with Concorde / HGS references, TSP validation sets with LKH references
 ```
 
-### NICO-100 (8 restarts)
+## Conventions
+
+* An instance batch is a `dict` of tensors. `cost_matrix` (B, V, V) is always the
+  objective; `coords`, `demand`, `capacity`, ... are optional inputs. The same code
+  therefore handles Euclidean and road-network costs.
+* A solution is a (B, L) cyclic sequence of node ids. Token k is the edge
+  (sol[k], sol[k+1]); move (i, j), i < j, cuts edges i and j and reverses
+  sol[i+1 .. j].
+* Every checkpoint stores its full config; loading is strict.
+
+## Train
 
 ```bash
-python run.py \
-  --eval_only \
-  --verbose \
-  --load_path outputs/nico100/rl_epoch-200.pt \
-  --eval_init_method random \
-  --eval_restarts 8 \
-  --val_graph_types unif unif unif unif tsplib \
-  --val_graph_sizes 20 50 100 500 100 \
-  --num_val_samples 100 100 100 100 100 \
-  --T_max_eval_mult 10 \
-  --save_full_trace \
-  --save_restart_traces \
-  --save_dir results/nico
+python scripts/train.py --config tsp/configs/nico_default.yaml
+python scripts/train.py --config cvrp/configs/nico_cvrp_default.yaml train.seed=43 run_name=cvrp_s43
+python scripts/train.py --config tsp/configs/nico_road.yaml \
+    data.road_root=<rrnco>/data/dataset data.road_split=<rrnco_city_splits.json>
 ```
 
-### NICO-100 (32 restarts)
+Any config field can be overridden as `section.field=value`. Metrics are appended to
+`outputs/<run_name>/metrics.jsonl` (add `--wandb-project NAME` for W&B).
+
+## Evaluate
 
 ```bash
-python run.py \
-  --eval_only \
-  --verbose \
-  --load_path outputs/nico100/rl_epoch-200.pt \
-  --eval_init_method random \
-  --eval_restarts 32 \
-  --val_graph_types unif unif unif unif tsplib \
-  --val_graph_sizes 20 50 100 500 100 \
-  --num_val_samples 100 100 100 100 100 \
-  --T_max_eval_mult 10 \
-  --save_full_trace \
-  --save_restart_traces \
-  --save_dir results/nico
+# TSP: 10n sampled moves from the stored node order, gap to Concorde
+python scripts/evaluate.py --checkpoint checkpoints/nico_tsp.pt \
+    --data data/tsp_unif100_test_seed1234.pkl \
+    --reference data/results/tsp_unif100_test_seed1234/concorde_costs.pkl
+# CVRP: refine POMO solutions, gap to HGS
+python scripts/evaluate.py --checkpoint checkpoints/nico_cvrp.pt \
+    --data data/cvrp/cvrp100_test.npz --init data/cvrp/pomo_test_seed1234_100.npz \
+    --reference data/cvrp/hgs_test_seed1234_100.npz
+# options: --init identity|random|<solutions.npz>  --restarts 8  --step-mult 10  --num 100
 ```
-
----
-
-## Evaluation from External Initial Solutions
-
-NICO can also be used as a **post-hoc refinement module** by loading externally generated initial tours.
-
-### NICO-100 with POMO initial solutions
-
-```bash
-python run.py \
-  --eval_only \
-  --verbose \
-  --load_path outputs/nico100/rl_epoch-200.pt \
-  --eval_init_method load \
-  --eval_init_path 'results/pomo/anytime_results_policyN100_{tag}_seed55.pkl' \
-  --val_graph_types unif unif unif tsplib \
-  --val_graph_sizes 50 100 500 100 \
-  --num_val_samples 100 100 100 100 \
-  --T_max_eval_mult 10 \
-  --save_full_trace \
-  --save_dir results/nico/pomo_load
-```
-
----
-
-## Notes
-
-* `--epoch_schedule IL:100,RL:200` denotes two-stage training with **100 imitation-learning epochs** followed by **200 reinforcement-learning epochs**.
-* `--T_max_eval_mult 10` evaluates each instance with a search budget of **10n improvement steps**.
-* `--eval_restarts k` runs NICO from `k` independent initial solutions and keeps the best result.
-* `--eval_init_method load` allows NICO to refine tours produced by an external method.
-
----
-
-## Output
-
-Evaluation results, traces, and restart trajectories are saved under the directory specified by `--save_dir`.
-
----
-
-## Citation
-
-If you use this repository in academic work, please cite the corresponding paper.

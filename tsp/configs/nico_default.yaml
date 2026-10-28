@@ -1,0 +1,83 @@
+# NICO default training run (TSP). Selected 2026-10-11 (ACTION_PLAN.md, Phase 6):
+#   features  S2: edge tokens without absolute coordinates, edge direction or raw length; length relative to the
+#             local k-NN spacing; mirror-invariant turning angles (cos, |sin|, sin_u*sin_v)
+#   decoder   gain-aware pairwise decoder (exact normalised 2-opt gain added to each move's logit)
+#   training  IL:100 (exact 2-step oracle, n in [20, 50]) then RL:20 (group RL, n in [20, 100], 32-move rollouts,
+#             half of the batches from late-search states after n..5n policy moves); Muon + AdamW, lr 3e-4
+#   cost      ~12 h of training (+ ~1 h validation) on one RTX PRO 6000 Blackwell
+# Most of the RL gain comes in the first ~10 RL epochs; longer RL, RL on n <= 200 or longer rollouts did not help.
+eval:
+  batch_size: 100
+  restarts: 1
+  sample: true
+  step_mult: 10.0
+model:
+  activation: relu
+  cycle_alpha_init: 0.1
+  cycle_mixing: true
+  delta_bias: true
+  embedding_dim: 128
+  features: geo
+  ffn_dim: 512
+  history_feature: true
+  logit_clip: 10.0
+  n_heads: 8
+  n_layers: 3
+  normalization: layer
+  coord_embed: false
+  edge_direction: false
+  len_local_scale: true
+  abs_length: false
+  reflect_invariant: true
+output_dir: outputs
+problem: tsp
+run_name: nico_default
+search:
+  history_len: 16
+  tabu_tenure: 8
+train:
+  behavior_refresh: 20
+  checkpoint_every: 10
+  epoch_size: 128000
+  extrap_dir: data/tsp_val
+  extrap_every: 10
+  extrap_num: 32
+  extrap_sizes:
+  - 100
+  - 200
+  - 500
+  - 1000
+  extrap_step_mult: 10.0
+  il:
+    batch_size: 256
+    lookahead: 2
+    size_range:
+    - 20
+    - 50
+    supervised_steps: 2
+  lr: 0.0003
+  lr_decay: 0.99
+  max_grad_norm: 1.0
+  optimizer: muon_adamw
+  reset_optimizer_on_stage_change: true
+  rl:
+    batch_size: 256
+    group_rotations: 1
+    group_size: 20
+    horizon: 32
+    ppo_clip: 0.2
+    rotation_consistency_coef: 0.0
+    size_range:
+    - 20
+    - 100
+    late_start_frac: 0.5
+    late_start_mult:
+    - 1.0
+    - 5.0
+  rollback_tol: 0.2
+  schedule: IL:100,RL:20
+  seed: 42
+  val_n: 100
+  val_size: 512
+  val_step_mult: 10.0
+  warmup_mult: 1.0

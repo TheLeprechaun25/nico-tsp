@@ -1,0 +1,84 @@
+# NICO-CVRP default run: the TSP default recipe (tsp/configs/nico_default.yaml) on the CVRP giant tour.
+#   moves     two operators on the giant tour: 2-opt (intra-route 2-opt and the reversing 2-opt*) and 2-opt*
+#             (exchange of two route tails); capacity-feasible moves from the per-token prefix / route loads (nico/problems/cvrp.py)
+#   features  S2 edge features of the TSP + demands, depot flags and loads relative to the capacity
+#   decoder   gain-aware pairwise decoder (exact normalised move gain added to each move's logit)
+#   training  as the TSP: IL:100 (exact 2-step oracle over feasible moves, n in [20, 50]) then RL:20 (n in
+#             [20, 100], late starts); capacity by size as in nico.problems.cvrp.capacity_for_size
+#   validation 512 generated n = 100 instances from random starts (mean cost)
+eval:
+  batch_size: 100
+  restarts: 1
+  sample: true
+  step_mult: 10.0
+model:
+  activation: relu
+  cycle_alpha_init: 0.1
+  cycle_mixing: true
+  delta_bias: true
+  operators:
+  - 2opt
+  - 2opt*
+  embedding_dim: 128
+  features: geo
+  ffn_dim: 512
+  history_feature: true
+  logit_clip: 10.0
+  n_heads: 8
+  n_layers: 3
+  normalization: layer
+  coord_embed: false
+  edge_direction: false
+  len_local_scale: true
+  abs_length: false
+  reflect_invariant: true
+output_dir: outputs
+problem: cvrp
+data:
+  extra_routes: 2
+run_name: nico_cvrp_default
+search:
+  history_len: 16
+  tabu_tenure: 8
+train:
+  behavior_refresh: 20
+  checkpoint_every: 10
+  epoch_size: 128000
+  extrap_dir: data/cvrp
+  extrap_every: 5
+  extrap_num: 32
+  extrap_sizes: []
+  extrap_step_mult: 10.0
+  il:
+    batch_size: 256
+    lookahead: 2
+    size_range:
+    - 20
+    - 50
+    supervised_steps: 2
+  lr: 0.0003
+  lr_decay: 0.99
+  max_grad_norm: 1.0
+  optimizer: muon_adamw
+  reset_optimizer_on_stage_change: true
+  rl:
+    batch_size: 256
+    group_rotations: 1
+    group_size: 20
+    horizon: 32
+    ppo_clip: 0.2
+    rotation_consistency_coef: 0.0
+    size_range:
+    - 20
+    - 100
+    late_start_frac: 0.5
+    late_start_mult:
+    - 1.0
+    - 5.0
+  rollback_tol: 0.2
+  schedule: IL:100,RL:20
+  seed: 42
+  val_n: 100
+  val_size: 512
+  val_step_mult: 10.0
+  warmup_mult: 1.0
